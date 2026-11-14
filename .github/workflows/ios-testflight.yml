@@ -3,6 +3,10 @@ name: iOS TestFlight
 on:
   workflow_dispatch:
     inputs:
+      app_version:
+        description: "iOS marketing version (for example 2026.11.14)"
+        required: true
+        type: string
       notes:
         description: "TestFlight release notes"
         required: false
@@ -11,7 +15,7 @@ on:
     inputs:
       app_version:
         description: Selected mobile release version (v-prefix allowed)
-        required: false
+        required: true
         type: string
       notes:
         description: "TestFlight release notes"
@@ -29,6 +33,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       eligible: ${{ steps.release.outputs.eligible }}
+      ios_version: ${{ steps.preflight.outputs.ios_version }}
+      bundle_id: ${{ steps.preflight.outputs.bundle_id }}
     steps:
       - name: Validate automatic release tag
         id: release
@@ -56,40 +62,13 @@ jobs:
           fi
           echo "eligible=true" >> "$GITHUB_OUTPUT"
 
-  build-and-upload:
-    needs: [validate-release]
-    if: needs.validate-release.outputs.eligible == 'true'
-    name: Build signed IPA and upload to TestFlight
-    runs-on: macos-26
-    timeout-minutes: 120
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-        with:
-          persist-credentials: false
-
-      - name: Resolve app version
-        id: version
+      - name: Validate TestFlight configuration
+        id: preflight
+        if: steps.release.outputs.eligible == 'true'
         shell: bash
         env:
           APP_VERSION_INPUT: ${{ inputs.app_version }}
-        run: |
-          set -euo pipefail
-          if [[ -n "$APP_VERSION_INPUT" ]]; then
-            version="${APP_VERSION_INPUT#v}"
-          elif [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" == v* ]]; then
-            version="${GITHUB_REF_NAME#v}"
-          else
-            version="$(sed -n 's/^version: *//p' mobile/pubspec.yaml)"
-            version="${version%%+*}"
-          fi
-          printf '%s\n' "$version" > .sure-version
-          echo "ios_version=${version%%-*}" >> "$GITHUB_OUTPUT"
-
-      - name: Check TestFlight credentials
-        id: check_prereqs
-        env:
+          APP_BUNDLE_ID: ${{ vars.IOS_APP_BUNDLE_ID || 'am.sure.mobile' }}
           IOS_KEYCHAIN_PASSWORD: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
           IOS_DISTRIBUTION_P12_BASE64: ${{ secrets.IOS_DISTRIBUTION_P12_BASE64 }}
           IOS_DISTRIBUTION_P12_PASSWORD: ${{ secrets.IOS_DISTRIBUTION_P12_PASSWORD }}
@@ -101,7 +80,26 @@ jobs:
           APP_STORE_CONNECT_API_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
           APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
         run: |
-          set -eu
+          set -euo pipefail
+
+          if [[ -n "$APP_VERSION_INPUT" ]]; then
+            version="${APP_VERSION_INPUT#v}"
+          elif [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" == v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            echo "::error::app_version is required for TestFlight releases"
+            exit 1
+          fi
+
+          ios_version="${version%%-*}"
+          if [[ ! "$ios_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid iOS marketing version: $ios_version"
+            exit 1
+          fi
+          if [[ ! "$APP_BUNDLE_ID" =~ ^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$ ]]; then
+            echo "::error::Invalid iOS bundle identifier"
+            exit 1
+          fi
 
           required=(
             IOS_KEYCHAIN_PASSWORD
@@ -115,32 +113,40 @@ jobs:
             APP_STORE_CONNECT_API_KEY_BASE64
             APP_STORE_CONNECT_API_ISSUER_ID
           )
-
           missing=()
           for var in "${required[@]}"; do
-            if [ -z "${!var-}" ]; then
+            if [[ -z "${!var-}" ]]; then
               missing+=("$var")
             fi
           done
-
-          if [ "${#missing[@]}" -eq 0 ]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-            exit 0
+          if (( ${#missing[@]} > 0 )); then
+            {
+              echo "## TestFlight configuration failed"
+              echo
+              echo "Missing required GitHub Actions secrets:"
+              printf -- "- \`%s\`\n" "${missing[@]}"
+            } >> "$GITHUB_STEP_SUMMARY"
+            printf "::error::Missing required TestFlight secret: %s\n" "${missing[@]}"
+            exit 1
           fi
 
-          echo "enabled=false" >> "$GITHUB_OUTPUT"
-          {
-            echo "Missing required TestFlight secrets:"
-            printf " - %s\n" "${missing[@]}"
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "ios_version=$ios_version" >> "$GITHUB_OUTPUT"
+          echo "bundle_id=$APP_BUNDLE_ID" >> "$GITHUB_OUTPUT"
 
-      - name: Skip iOS TestFlight upload
-        if: ${{ steps.check_prereqs.outputs.enabled != 'true' }}
-        run: |
-          echo "Skipping TestFlight upload because required credentials are not configured."
+  build-and-upload:
+    needs: [validate-release]
+    if: needs.validate-release.outputs.eligible == 'true'
+    name: Build signed IPA and upload to TestFlight
+    runs-on: macos-26
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
 
       - name: Select Xcode 26
-        if: ${{ steps.check_prereqs.outputs.enabled == 'true' }}
         run: |
           set -euo pipefail
           sudo xcode-select -s /Applications/Xcode_26.4.app/Contents/Developer
@@ -149,7 +155,6 @@ jobs:
 
       - name: Set up Flutter
         uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
-        if: ${{ steps.check_prereqs.outputs.enabled == 'true' }}
         with:
           flutter-version: '3.32.4'
           channel: 'stable'
@@ -157,22 +162,18 @@ jobs:
 
       - name: Install Flutter dependencies
         working-directory: mobile
-        if: ${{ steps.check_prereqs.outputs.enabled == 'true' }}
         run: flutter pub get
 
       - name: Generate app icons
         working-directory: mobile
-        if: ${{ steps.check_prereqs.outputs.enabled == 'true' }}
         run: flutter pub run flutter_launcher_icons
 
       - name: Install CocoaPods
         working-directory: mobile/ios
-        if: ${{ steps.check_prereqs.outputs.enabled == 'true' }}
         run: pod install
 
       - name: Configure iOS signing assets
         id: signing
-        if: ${{ steps.check_prereqs.outputs.enabled == 'true' }}
         env:
           KEYCHAIN_PASSWORD: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
           DIST_P12_BASE64: ${{ secrets.IOS_DISTRIBUTION_P12_BASE64 }}
@@ -184,6 +185,7 @@ jobs:
 
           KEYCHAIN_PATH="$RUNNER_TEMP/ios-signing.keychain-db"
           PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+          echo "keychain-path=$KEYCHAIN_PATH" >> "$GITHUB_OUTPUT"
 
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 3600 "$KEYCHAIN_PATH"
@@ -191,25 +193,24 @@ jobs:
           security list-keychains -d user -s "$KEYCHAIN_PATH"
 
           CERT_PATH="$RUNNER_TEMP/distribution.p12"
-          echo "$DIST_P12_BASE64" | base64 --decode > "$CERT_PATH"
+          echo "$DIST_P12_BASE64" | openssl base64 -d -A > "$CERT_PATH"
           security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$DIST_P12_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
           if [ -n "$PROFILE_BASE64" ] && [ -n "$PROFILE_NAME" ]; then
             mkdir -p "$PROFILE_DIR"
             PROFILE_PATH="$PROFILE_DIR/${PROFILE_NAME}.mobileprovision"
-            echo "$PROFILE_BASE64" | base64 --decode > "$PROFILE_PATH"
+            echo "profile-path=$PROFILE_PATH" >> "$GITHUB_OUTPUT"
+            echo "$PROFILE_BASE64" | openssl base64 -d -A > "$PROFILE_PATH"
           fi
 
           rm -f "$CERT_PATH"
-          echo "keychain-path=$KEYCHAIN_PATH" >> "$GITHUB_OUTPUT"
 
       - name: Build signed IPA
         working-directory: mobile
-        if: ${{ steps.check_prereqs.outputs.enabled == 'true' }}
         env:
-          IOS_VERSION: ${{ steps.version.outputs.ios_version }}
-          APP_BUNDLE_ID: ${{ vars.IOS_APP_BUNDLE_ID || 'am.sure.mobile' }}
+          IOS_VERSION: ${{ needs.validate-release.outputs.ios_version }}
+          APP_BUNDLE_ID: ${{ needs.validate-release.outputs.bundle_id }}
           IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
           PROFILE_NAME: ${{ secrets.IOS_PROVISIONING_PROFILE_NAME }}
           IOS_DISTRIBUTION_CERT_NAME: ${{ secrets.IOS_DISTRIBUTION_CERT_NAME }}
@@ -315,7 +316,6 @@ jobs:
 
       - name: Prepare TestFlight auth key
         id: testflight_key
-        if: ${{ steps.check_prereqs.outputs.enabled == 'true' }}
         env:
           APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
           APP_STORE_CONNECT_API_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
@@ -324,13 +324,12 @@ jobs:
           KEY_DIR="$HOME/.appstoreconnect/private_keys"
           mkdir -p "$KEY_DIR"
           KEY_FILE="$KEY_DIR/AuthKey_${APP_STORE_CONNECT_API_KEY_ID}.p8"
-          echo "$APP_STORE_CONNECT_API_KEY_BASE64" | base64 --decode > "$KEY_FILE"
+          echo "$APP_STORE_CONNECT_API_KEY_BASE64" | openssl base64 -d -A > "$KEY_FILE"
           chmod 600 "$KEY_FILE"
           echo "key-file=$KEY_FILE" >> "$GITHUB_OUTPUT"
 
       - name: Upload IPA to TestFlight
         working-directory: mobile
-        if: ${{ steps.check_prereqs.outputs.enabled == 'true' }}
         env:
           APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
           APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
@@ -351,7 +350,6 @@ jobs:
             --apiIssuer "$APP_STORE_CONNECT_API_ISSUER_ID"
 
       - name: Upload build artifact
-        if: ${{ steps.check_prereqs.outputs.enabled == 'true' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: ios-ipa-testflight
@@ -359,7 +357,7 @@ jobs:
           if-no-files-found: error
 
       - name: Cleanup signing keychain
-        if: ${{ always() && steps.check_prereqs.outputs.enabled == 'true' }}
+        if: ${{ always() }}
         env:
           APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
         run: |
@@ -371,3 +369,9 @@ jobs:
 
           KEY_FILE="$HOME/.appstoreconnect/private_keys/AuthKey_${APP_STORE_CONNECT_API_KEY_ID}.p8"
           rm -f "$KEY_FILE"
+          rm -f "$RUNNER_TEMP/distribution.p12"
+
+          PROFILE_PATH="${{ steps.signing.outputs.profile-path }}"
+          if [ -n "$PROFILE_PATH" ]; then
+            rm -f "$PROFILE_PATH"
+          fi
