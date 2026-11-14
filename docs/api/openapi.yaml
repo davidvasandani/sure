@@ -489,6 +489,8 @@ components:
         error:
           type: string
           nullable: true
+          description: Localized, application-owned error copy safe for display; provider
+            diagnostics are never returned
         created_at:
           type: string
           format: date-time

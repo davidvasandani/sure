@@ -1906,6 +1906,24 @@ Upgrading: deployments that set only the URL and token keep working. When no age
 - [Langfuse Documentation](https://langfuse.com/docs)
 - [Sure GitHub Repository](https://github.com/we-promise/sure)
 
+## Exhausted OpenAI API credits
+
+If chat reports exhausted OpenAI API credits, ask your Sure administrator to
+restore credits for the OpenAI account configured in Sure, then manually select
+**Retry** on the saved question. A valid API key and a running worker do not
+provide account capacity. Repeated retries while the account remains unfunded
+will show the same explanation.
+
+An administrator may explicitly configure a supported alternative provider. It
+must support the model saved on the original question: changing the default model
+does not rewrite existing questions. Sure does not automatically switch providers
+in response to this error.
+
+The error-reporting change cannot fund an account. Production recovery requires
+an operator to restore capacity and verify that a retried answer persists after
+reload. The AI health page performs live provider probes; opening it is not a
+passive configuration check.
+
 ## Support
 
 For issues with AI features:

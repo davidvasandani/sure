@@ -28,7 +28,7 @@
           </div>
         <% end %>
 
-        <% if @chat.error.present? && @chat.needs_assistant_response? %>
+        <% if @chat.error.present? %>
           <%= render "chats/error", chat: @chat %>
         <% end %>
       </div>

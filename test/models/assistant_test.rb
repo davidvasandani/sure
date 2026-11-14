@@ -2,6 +2,7 @@ require "test_helper"
 
 class AssistantTest < ActiveSupport::TestCase
   include ProviderTestHelper
+  include ActiveJob::TestHelper
 
   test "default registry includes the analytical read tools and gates preview reads" do
     default_classes = Assistant.function_classes
@@ -56,6 +57,71 @@ class AssistantTest < ActiveSupport::TestCase
 
     assert_no_difference "AssistantMessage.count"  do
       @assistant.respond_to(@message)
+    end
+  end
+
+  [ false, true ].each do |partial|
+    test "native credit rejection and manual recovery preserve history with partial=#{partial}" do
+      provider = Provider::Openai.new("test-token")
+      provider.stubs(:log_langfuse_generation)
+      provider.stubs(:supports_responses_endpoint?).returns(true)
+      @assistant.stubs(:get_model_provider).with(@message.ai_model).returns(provider)
+      @chat.messages.where(type: "AssistantMessage", status: :pending).destroy_all
+      earlier = @chat.messages.create!(type: "AssistantMessage", content: "Earlier completed answer", ai_model: @message.ai_model,
+                                      created_at: @message.created_at - 1.second)
+      original_questions = @chat.messages.where(type: "UserMessage").ordered.pluck(:id, :content, :ai_model)
+      canary = "sk-synthetic-upstream-canary"
+
+      2.times do |attempt|
+        if attempt.positive?
+          assert_enqueued_with(job: AssistantResponseJob, args: ->(args) { args.first.id == @message.id }) { @chat.retry_last_message! }
+          assert_nil @chat.reload.error
+        else
+          @chat.ask_assistant_later(@message)
+        end
+        pending = pending_assistant_message
+        provider.send(:client).responses.expects(:create).with do |parameters:|
+          assert_equal @message.ai_model, parameters[:model]
+          parameters[:stream].call("type" => "response.output_text.delta", "delta" => "Synthetic partial answer") if partial
+          parameters[:stream].call("type" => "error", "error" => { "code" => "credit_balance_exhausted", "message" => canary })
+          true
+        end.returns(nil)
+
+        @assistant.respond_to(@message, assistant_message: pending)
+
+        assert_equal I18n.t("chat.errors.openai_credits_exhausted"), @chat.reload.presentable_error_message
+        assert_not_includes @chat.error, canary
+        if partial
+          assert pending.reload.failed?
+        else
+          assert_not Message.exists?(pending.id)
+        end
+      end
+
+      assert_enqueued_with(job: AssistantResponseJob, args: ->(args) { args.first.id == @message.id }) { @chat.retry_last_message! }
+      pending = pending_assistant_message
+      history = @chat.messages.where(status: :complete).ordered.pluck(:content)
+      result = provider_response_chunk(id: "synthetic-success", model: @message.ai_model,
+                                      messages: [ provider_message(id: "answer", text: "Recovered answer") ], function_requests: [])
+      @provider.expects(:chat_response).with do |prompt, **options|
+        assert_equal @message.content, prompt
+        assert_equal @message.ai_model, options[:model]
+        assert_equal history, options[:messages].map { |record| record[:content] }
+        assert_not_includes options[:messages].map { |record| record[:content] }, "Synthetic partial answer"
+        options[:streamer].call(provider_text_chunk("Recovered answer"))
+        options[:streamer].call(result)
+        true
+      end.returns(provider_success_response(result.data))
+      @assistant.stubs(:get_model_provider).with(@message.ai_model).returns(@provider)
+
+      @assistant.respond_to(@message, assistant_message: pending)
+
+      assert_nil @chat.reload.error
+      assert_equal "Recovered answer", pending.reload.content
+      assert pending.complete?
+      assert_equal @message.ai_model, pending.ai_model
+      assert_equal original_questions, @chat.messages.where(type: "UserMessage").ordered.pluck(:id, :content, :ai_model)
+      assert_equal [ earlier.id, pending.id ], @chat.messages.where(type: "AssistantMessage", status: :complete).ordered.pluck(:id)
     end
   end
 

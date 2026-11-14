@@ -1,6 +1,7 @@
 require "test_helper"
 
 class ChatsControllerTest < ActionDispatch::IntegrationTest
+  include ActionCable::TestHelper
   setup do
     @user = users(:family_admin)
     @family = families(:dylan_family)
@@ -151,6 +152,61 @@ class ChatsControllerTest < ActionDispatch::IntegrationTest
     end
 
     assert_redirected_to chats_url
+  end
+
+  [ false, true ].each do |debug|
+    test "credit and hostile legacy errors stay private on reload and broadcast with debug=#{debug}" do
+      chat = chats(:two)
+      chat.update!(user: @user)
+      canary = "sk-synthetic-private-canary"
+      chat.messages.create!(type: "AssistantMessage", content: "Synthetic partial answer", ai_model: "gpt-4.1", status: :failed)
+
+      with_env_overrides AI_DEBUG_MODE: debug.to_s do
+        [
+          { "failure_code" => "openai_credits_exhausted", "message" => canary, "technical_message" => canary },
+          { "message" => canary, "technical_message" => canary }.to_json,
+          canary,
+          canary.to_json
+        ].each do |payload|
+          chat.update!(error: payload)
+          get chat_url(chat)
+          assert_response :success
+          assert_select "##{chat.error_target} [role=alert]", count: 1
+          assert_select "##{chat.error_target} form[action='#{retry_chat_path(chat)}']", count: 1
+          assert_not_includes response.body, canary
+        end
+
+        broadcasts = capture_broadcasts(chat.to_gid_param) do
+          chat.add_error(Provider::Openai::Error.new(canary, failure_code: :openai_credits_exhausted))
+        end
+        assert_equal 1, broadcasts.size
+        html = broadcasts.first
+        assert_includes html, chat.error_target
+        assert_includes html, I18n.t("chat.errors.openai_credits_exhausted")
+        assert_not_includes html, canary
+      end
+    end
+  end
+
+  test "retry after partial failure reuses the saved question" do
+    chat = chats(:two)
+    chat.update!(user: @user)
+    question = messages(:chat2_user)
+    chat.messages.create!(type: "AssistantMessage", content: "Synthetic partial answer", ai_model: question.ai_model, status: :failed)
+    Chat.any_instance.expects(:ask_assistant_later).with(question).once
+
+    post retry_chat_url(chat)
+
+    assert_redirected_to chat_path(chat)
+  end
+
+  test "retry is blocked when the family disables built in AI" do
+    @family.update!(assistant_type: "mcp_only")
+    Chat.any_instance.expects(:ask_assistant_later).never
+
+    post retry_chat_url(chats(:one))
+
+    assert_redirected_to chat_path(chats(:one))
   end
 
   test "retries last user message" do

@@ -1,6 +1,9 @@
 class Chat < ApplicationRecord
   include Debuggable
 
+  ERROR_CATEGORIES = %w[default rate_limited temporarily_unavailable misconfigured no_response].freeze
+  CREDIT_FAILURE_CODE = "openai_credits_exhausted".freeze
+
   RATE_LIMIT_PATTERNS = [
     /\b429\b/i,
     /rate limit/i,
@@ -77,14 +80,10 @@ class Chat < ApplicationRecord
   end
 
   def retry_last_message!
-    update!(error: nil)
-
-    last_message = conversation_messages.ordered.last
-
-    if last_message.present? && last_message.role == "user"
-
-      ask_assistant_later(last_message)
+    question = conversation_messages.ordered.reverse_order.detect do |message|
+      !(message.is_a?(AssistantMessage) && message.failed?)
     end
+    ask_assistant_later(question) if question.is_a?(UserMessage)
   end
 
   def update_latest_response!(provider_response_id)
@@ -98,7 +97,16 @@ class Chat < ApplicationRecord
 
   def presentable_error_message
     return nil if error.blank?
-    parsed_error_payload["message"].presence || classify_error_message(error)
+
+    payload = parsed_error_payload
+    return I18n.t("chat.errors.openai_credits_exhausted") if payload["failure_code"] == CREDIT_FAILURE_CODE
+    return I18n.t("chat.errors.no_response") if payload["type"] == "DeliveryTimeout"
+
+    message = [ payload["message"], payload["technical_message"], parsed_legacy_error_message, error ].find { |value| value.is_a?(String) && value.present? }
+    category = ERROR_CATEGORIES.find do |candidate|
+      I18n.available_locales.any? { |locale| message == I18n.t("chat.errors.#{candidate}", locale: locale) }
+    end
+    category ? I18n.t("chat.errors.#{category}") : classify_error_message(message)
   end
 
   def technical_error_message
@@ -262,6 +270,15 @@ class Chat < ApplicationRecord
     end
 
     def build_error_payload(error)
+      if error.respond_to?(:failure_code) && [ CREDIT_FAILURE_CODE, CREDIT_FAILURE_CODE.to_sym ].include?(error.failure_code)
+        return {
+          failure_code: CREDIT_FAILURE_CODE,
+          message: I18n.t("chat.errors.openai_credits_exhausted"),
+          technical_message: "OpenAI API credits are exhausted.",
+          type: "Provider::Openai::Error"
+        }
+      end
+
       technical_message = error_message_for(error)
 
       {

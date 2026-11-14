@@ -326,7 +326,11 @@ RSpec.configure do |config|
             properties: {
               id: { type: :string, format: :uuid },
               title: { type: :string },
-              error: { type: :string, nullable: true },
+              error: {
+                type: :string,
+                nullable: true,
+                description: "Localized, application-owned error copy safe for display; provider diagnostics are never returned"
+              },
               created_at: { type: :string, format: :'date-time' },
               updated_at: { type: :string, format: :'date-time' }
             }

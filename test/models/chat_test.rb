@@ -1,6 +1,8 @@
 require "test_helper"
 
 class ChatTest < ActiveSupport::TestCase
+  include ActiveJob::TestHelper
+
   setup do
     @user = users(:family_admin)
     @assistant = mock
@@ -197,6 +199,159 @@ class ChatTest < ActiveSupport::TestCase
 
     assert_equal I18n.t("chat.errors.rate_limited"), chat.presentable_error_message
     assert_equal "OpenAI API error 429: rate limit exceeded", chat.technical_error_message
+  end
+
+  test "credit errors persist only application owned values and translate on read" do
+    chat = chats(:two)
+    canary = "sk-synthetic-credit-canary https://private.example/project"
+    error = Provider::Openai::Error.new("429 #{canary}", details: { secret: canary }, failure_code: :openai_credits_exhausted)
+
+    I18n.with_locale(:en) { chat.add_error(error) }
+
+    payload = JSON.parse(chat.reload.error)
+    assert_equal "openai_credits_exhausted", payload["failure_code"]
+    assert_equal "Provider::Openai::Error", payload["type"]
+    assert_equal "OpenAI API credits are exhausted.", payload["technical_message"]
+    assert_equal I18n.t("chat.errors.openai_credits_exhausted", locale: :en), payload["message"]
+    assert_not_includes chat.error, canary
+
+    I18n.with_locale(:es) do
+      assert I18n.exists?("chat.errors.openai_credits_exhausted", :es, fallback: false)
+      assert_equal I18n.t("chat.errors.openai_credits_exhausted"), chat.presentable_error_message
+      assert_not_equal payload["message"], chat.presentable_error_message
+    end
+  end
+
+  test "stored credit code is allowlisted and hostile messages cannot replace its copy" do
+    chat = chats(:two)
+    [ false, true ].each do |serialize|
+      payload = { "failure_code" => "openai_credits_exhausted", "message" => "sk-synthetic-canary", "technical_message" => "429 sk-synthetic-canary" }
+      chat.update!(error: serialize ? payload.to_json : payload)
+      assert_equal I18n.t("chat.errors.openai_credits_exhausted"), chat.reload.presentable_error_message
+    end
+  end
+
+  test "credit copy falls back to English when the locale has no translation" do
+    chat = chats(:two)
+    chat.update!(error: { "failure_code" => "openai_credits_exhausted" })
+
+    I18n.with_locale(:de) do
+      assert_not I18n.exists?("chat.errors.openai_credits_exhausted", :de, fallback: false)
+      assert_equal I18n.t("chat.errors.openai_credits_exhausted", locale: :en), chat.presentable_error_message
+    end
+  end
+
+  test "unknown and non string error fields never become public copy or translation keys" do
+    chat = chats(:two)
+    [ "chat.errors.no_response", "credit_balance_exhausted", "unknown", 123, [ "openai_credits_exhausted" ], { "code" => "openai_credits_exhausted" } ].each do |code|
+      [ "sk-synthetic-canary", 123, [ "sk-synthetic-canary" ], { "secret" => "sk-synthetic-canary" } ].each do |message|
+        chat.update!(error: { "failure_code" => code, "message" => message, "technical_message" => message, "type" => [ "DeliveryTimeout" ] })
+        assert_equal I18n.t("chat.errors.default"), chat.reload.presentable_error_message
+      end
+    end
+  end
+
+  test "legacy errors retain safe categories in hash JSON and plain string forms" do
+    chat = chats(:two)
+    {
+      "429 sk-synthetic-canary" => "rate_limited",
+      "503 sk-synthetic-canary" => "temporarily_unavailable",
+      "request timeout sk-synthetic-canary" => "temporarily_unavailable",
+      "invalid api key sk-synthetic-canary" => "misconfigured",
+      "credit_balance_exhausted sk-synthetic-canary" => "default"
+    }.each do |message, category|
+      payload = { "message" => message, "technical_message" => message }
+      [ payload, payload.to_json, message.to_json, message ].each do |stored|
+        chat.update!(error: stored)
+        assert_equal I18n.t("chat.errors.#{category}"), chat.reload.presentable_error_message
+        assert_not_includes chat.presentable_error_message, "sk-synthetic-canary"
+      end
+    end
+  end
+
+  test "malformed and non object error JSON falls back without raising" do
+    chat = chats(:two)
+    [ "{broken sk-synthetic-canary", "[]", "123", "true", "null", [ "sk-synthetic-canary" ], 123, true ].each do |stored|
+      chat.update!(error: stored)
+      assert_equal I18n.t("chat.errors.default"), chat.reload.presentable_error_message
+    end
+  end
+
+  test "legacy application copy is translated in the readers locale" do
+    chat = chats(:two)
+    %w[default rate_limited temporarily_unavailable misconfigured no_response].each do |category|
+      old_message = I18n.t("chat.errors.#{category}", locale: :en)
+      [ old_message, old_message.to_json, { "message" => old_message }.to_json ].each do |stored|
+        chat.update!(error: stored)
+        I18n.with_locale(:es) do
+          assert_equal I18n.t("chat.errors.#{category}"), chat.reload.presentable_error_message
+        end
+      end
+    end
+  end
+
+  test "DeliveryTimeout type preserves timeout copy across locale changes" do
+    chat = chats(:two)
+    chat.update!(error: { "type" => "DeliveryTimeout", "message" => I18n.t("chat.errors.no_response", locale: :es), "technical_message" => "sk-synthetic-canary" }.to_json)
+
+    I18n.with_locale(:en) do
+      assert_equal I18n.t("chat.errors.no_response"), chat.reload.presentable_error_message
+    end
+  end
+
+  [ 0, 1, 3 ].each do |failed_count|
+    test "retry reuses the original question and model after #{failed_count} failed attempts" do
+      chat = chats(:two)
+      question = messages(:chat2_user)
+      original_content = question.content
+      question.update!(ai_model: "saved-synthetic-model")
+      failed_count.times do |index|
+        chat.messages.create!(type: "AssistantMessage", content: "Synthetic partial answer", ai_model: question.ai_model,
+                              status: :failed, created_at: question.created_at + (index + 1).minutes)
+      end
+      chat.update!(error: { "message" => "Synthetic failure" }.to_json)
+      original_ids = chat.messages.ordered.pluck(:id)
+      BackgroundJobHealth.stubs(:ai_busy?).returns(false)
+
+      assert_difference -> { chat.messages.where(type: "AssistantMessage", status: :pending).count }, 1 do
+        assert_no_difference -> { chat.messages.where(type: "UserMessage").count } do
+          assert_enqueued_with(job: AssistantResponseJob, args: ->(args) { args.first == question && args.last.pending? && args.last.ai_model == question.ai_model }) do
+            chat.retry_last_message!
+          end
+        end
+      end
+
+      assert_nil chat.reload.error
+      assert_equal original_ids, chat.messages.ordered.pluck(:id).first(original_ids.size)
+      assert_equal original_content, question.reload.content
+    end
+  end
+
+  [ :pending, :complete ].each do |status|
+    test "retry cannot skip a #{status} assistant even behind a failed attempt" do
+      chat = chats(:two)
+      chat.messages.create!(type: "AssistantMessage", content: "Synthetic answer", ai_model: "gpt-4.1", status: status, created_at: 2.minutes.ago)
+      chat.messages.create!(type: "AssistantMessage", content: "Synthetic partial answer", ai_model: "gpt-4.1", status: :failed, created_at: 1.minute.ago)
+      chat.update!(error: { "message" => "Synthetic failure" }.to_json)
+      stored_error = chat.error
+
+      assert_no_enqueued_jobs(only: AssistantResponseJob) do
+        assert_no_difference -> { chat.messages.count } do
+          chat.retry_last_message!
+        end
+      end
+      assert_equal stored_error, chat.reload.error
+    end
+  end
+
+  test "retry preserves errors on an empty conversation" do
+    chat = @user.chats.create!(title: "Synthetic empty chat", error: { "message" => "Synthetic failure" }.to_json)
+    stored_error = chat.error
+
+    assert_no_enqueued_jobs(only: AssistantResponseJob) { chat.retry_last_message! }
+
+    assert_equal stored_error, chat.reload.error
+    assert_empty chat.messages
   end
 
   test "handle_undelivered_response! clears a blank pending bubble and records an error + debug log" do
