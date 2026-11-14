@@ -1136,7 +1136,132 @@ class Provider::OpenaiTest < ActiveSupport::TestCase
     assert_equal [ 10, 5, 15 ], [ recorded.prompt_tokens, recorded.completion_tokens, recorded.total_tokens ]
   end
 
+  [ false, true ].each do |custom|
+    [ false, true ].each do |responses|
+      test "structured HTTP credit errors are native only with custom=#{custom} responses=#{responses}" do
+        provider = credit_error_provider(custom: custom, responses: responses)
+        body = { "error" => { "code" => "credit_balance_exhausted", "message" => "sk-synthetic-credit-canary" } }
+        family = families(:dylan_family)
+
+        [ body, body.to_json ].each do |response_body|
+          upstream_error = Faraday::TooManyRequestsError.new("Synthetic HTTP 429", { status: 429, body: response_body })
+          endpoint = responses ? provider.send(:client).responses : provider.send(:client)
+          endpoint.expects(responses ? :create : :chat).raises(upstream_error)
+          provider.expects(:record_llm_usage).with(family: family, model: "gpt-4.1", operation: "chat", error: upstream_error).once
+
+          response = provider.chat_response("Synthetic question", model: "gpt-4.1", family: family)
+
+          assert_not response.success?
+          assert_nil response.data
+          assert_instance_of Provider::Openai::Error, response.error
+          assert_equal upstream_error.message, response.error.message
+          assert_equal response_body, response.error.details
+          if custom
+            assert_nil response.error.failure_code
+          else
+            assert_equal :openai_credits_exhausted, response.error.failure_code
+          end
+        end
+      end
+
+      test "HTTP credit classification rejects missing unknown malformed and message only codes with custom=#{custom} responses=#{responses}" do
+        provider = credit_error_provider(custom: custom, responses: responses)
+        bodies = [
+          nil, {}, "{broken", "[]", "123", "true", "null", [], 123,
+          "credit_balance_exhausted", { "code" => "credit_balance_exhausted" },
+          { "error" => "credit_balance_exhausted" },
+          { "error" => { "message" => "credit_balance_exhausted sk-synthetic-canary" } },
+          { "error" => { "code" => "rate_limit_exceeded" } },
+          { "error" => { "code" => "unknown" } },
+          { "error" => { "code" => [ "credit_balance_exhausted" ] } },
+          { "error" => { "code" => "CREDIT_BALANCE_EXHAUSTED" } }
+        ]
+
+        bodies.each do |body|
+          upstream_error = Faraday::TooManyRequestsError.new("Synthetic HTTP 429", { status: 429, body: body })
+          endpoint = responses ? provider.send(:client).responses : provider.send(:client)
+          endpoint.expects(responses ? :create : :chat).raises(upstream_error)
+          provider.expects(:record_llm_usage).with(family: nil, model: "gpt-4.1", operation: "chat", error: upstream_error).once
+
+          response = provider.chat_response("Synthetic question", model: "gpt-4.1")
+
+          assert_not response.success?
+          assert_nil response.data
+          assert_nil response.error.failure_code
+          assert_equal upstream_error.message, response.error.message
+          if body.nil?
+            assert_nil response.error.details
+          else
+            assert_equal body, response.error.details
+          end
+        end
+      end
+    end
+
+    [ "error", "response.failed" ].each do |event|
+      test "parsed #{event} credit code is native only with custom=#{custom}" do
+        provider = credit_error_provider(custom: custom, responses: true)
+        family = families(:dylan_family)
+        error_body = { "error" => { "code" => "credit_balance_exhausted", "message" => "Synthetic rejection sk-synthetic-canary" } }
+        chunk = event == "error" ? error_body.merge("type" => event) : { "type" => event, "response" => error_body }
+        provider.send(:client).responses.expects(:create).with do |parameters:|
+          parameters[:stream].call(chunk)
+          true
+        end.returns(nil)
+        chunks = []
+
+        assert_difference -> { family.llm_usages.count }, 1 do
+          response = provider.chat_response("Synthetic question", model: "gpt-4.1", family: family, streamer: ->(value) { chunks << value })
+
+          assert_not response.success?
+          assert_nil response.data
+          assert_match "Synthetic rejection", response.error.message
+          assert_match "credit_balance_exhausted", response.error.message
+          if custom
+            assert_nil response.error.failure_code
+          else
+            assert_equal :openai_credits_exhausted, response.error.failure_code
+          end
+        end
+
+        assert_equal [ "error" ], chunks.map(&:type)
+        assert_equal "credit_balance_exhausted", chunks.first.data.code
+        usage = family.llm_usages.order(:created_at).last
+        assert_equal [ 0, 0, 0 ], [ usage.prompt_tokens, usage.completion_tokens, usage.total_tokens ]
+        assert_nil usage.estimated_cost
+      end
+    end
+
+    test "stream credit classification ignores absent unknown and message only codes with custom=#{custom}" do
+      provider = credit_error_provider(custom: custom, responses: true)
+
+      [ nil, "unknown", "rate_limit_exceeded", "CREDIT_BALANCE_EXHAUSTED", [ "credit_balance_exhausted" ] ].each do |code|
+        provider.send(:client).responses.expects(:create).with do |parameters:|
+          parameters[:stream].call("type" => "error", "error" => { "code" => code, "message" => "credit_balance_exhausted sk-synthetic-canary" })
+          true
+        end.returns(nil)
+
+        response = provider.chat_response("Synthetic question", model: "gpt-4.1", streamer: ->(_) { })
+
+        assert_not response.success?
+        assert_nil response.data
+        assert_nil response.error.failure_code
+      end
+    end
+  end
+
   private
+    def credit_error_provider(custom:, responses:)
+      provider = if custom
+        Provider::Openai.new("test-token", uri_base: "https://custom.example/v1", model: "gpt-4.1")
+      else
+        Provider::Openai.new("test-token")
+      end
+      provider.stubs(:supports_responses_endpoint?).returns(responses)
+      provider.stubs(:log_langfuse_generation)
+      provider
+    end
+
     # Verify the response budget at the provider-to-processor boundary.
     # @param limit [Integer, nil] expected explicit cap or omitted cap
     def expect_pdf_response_limit(provider, model:, limit:)

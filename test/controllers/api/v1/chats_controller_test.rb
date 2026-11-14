@@ -85,6 +85,31 @@ class Api::V1::ChatsControllerTest < ActionDispatch::IntegrationTest
     assert response_body["messages"].is_a?(Array)
   end
 
+  test "show exposes only localized safe chat errors through an API key" do
+    plain_key = ApiKey.generate_secure_key
+    api_key = @user.api_keys.build(name: "Chat error test", scopes: [ "read" ])
+    api_key.key = plain_key
+    api_key.save!
+
+    @chat.add_error(Provider::Openai::Error.new("sk-synthetic-upstream", failure_code: :openai_credits_exhausted))
+    get "/api/v1/chats/#{@chat.id}", headers: { "X-Api-Key" => plain_key }
+
+    assert_response :success
+    assert_equal I18n.t("chat.errors.openai_credits_exhausted"), JSON.parse(response.body)["error"]
+    assert_not_includes response.body, "sk-synthetic-upstream"
+
+    @chat.update!(error: { message: "sk-synthetic-legacy", technical_message: "sk-synthetic-legacy" })
+    get "/api/v1/chats/#{@chat.id}", headers: { "X-Api-Key" => plain_key }
+
+    assert_response :success
+    assert_equal I18n.t("chat.errors.default"), JSON.parse(response.body)["error"]
+    assert_not_includes response.body, "sk-synthetic-legacy"
+
+    @chat.update!(error: nil)
+    get "/api/v1/chats/#{@chat.id}", headers: { "X-Api-Key" => plain_key }
+    assert_nil JSON.parse(response.body)["error"]
+  end
+
   test "should create chat with write scope" do
     assert_difference "Chat.count" do
       post "/api/v1/chats",

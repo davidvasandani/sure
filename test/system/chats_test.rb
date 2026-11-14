@@ -1,9 +1,83 @@
 require "application_system_test_case"
 
 class ChatsTest < ApplicationSystemTestCase
+  include ActiveJob::TestHelper
   setup do
     @user = users(:family_admin)
     login_as(@user)
+  end
+
+  test "credit error survives reload and manual retries without exposing diagnostics" do
+    with_env_overrides OPENAI_ACCESS_TOKEN: "test-token", AI_DEBUG_MODE: "true" do
+      chat = chats(:two)
+      chat.update!(user: @user, title: "Synthetic credit recovery", error: nil)
+      question = messages(:chat2_user)
+      question.update!(content: "Synthetic saved question")
+      provider = Provider::Openai.new("test-token")
+      provider.stubs(:supports_responses_endpoint?).returns(true)
+      provider.stubs(:log_langfuse_generation)
+      Assistant::Builtin.any_instance.stubs(:get_model_provider).with(question.ai_model).returns(provider)
+      canary = "sk-synthetic-browser-canary"
+
+      visit chat_path(chat)
+      assert_selector "turbo-cable-stream-source[connected]", visible: :all
+      chat.ask_assistant_later(question)
+      assert_text I18n.t("chats.thinking")
+
+      2.times do |attempt|
+        if attempt.positive?
+          within all("##{chat.error_target}").last do
+            click_button I18n.t("chats.error.retry")
+          end
+          page.refresh
+          assert_no_selector "##{chat.error_target}"
+          assert_text I18n.t("chats.thinking")
+        end
+        provider.send(:client).responses.expects(:create).with do |parameters:|
+          parameters[:stream].call("type" => "response.output_text.delta", "delta" => "Synthetic partial answer")
+          parameters[:stream].call("type" => "error", "error" => { "code" => "credit_balance_exhausted", "message" => canary })
+          true
+        end.returns(nil)
+
+        perform_enqueued_jobs(only: AssistantResponseJob)
+
+        assert_text I18n.t("chat.errors.openai_credits_exhausted")
+        assert_no_text canary
+        page.refresh
+        assert_selector "##{chat.error_target}", text: I18n.t("chat.errors.openai_credits_exhausted")
+        assert_text "Synthetic partial answer"
+        assert_no_text canary
+      end
+
+      evidence = Rails.root.join("specs/vk/dbc7/evidence/chat-credit-error.png")
+      FileUtils.mkdir_p(evidence.dirname)
+      page.save_screenshot(evidence)
+
+      provider.send(:client).responses.expects(:create).with do |parameters:|
+        assert_equal question.ai_model, parameters[:model]
+        parameters[:stream].call("type" => "response.output_text.delta", "delta" => "Synthetic recovered answer")
+        parameters[:stream].call("type" => "response.completed", "response" => {
+          "id" => "synthetic-response", "model" => question.ai_model,
+          "output" => [ { "type" => "message", "id" => "synthetic-message", "content" => [ { "text" => "Synthetic recovered answer" } ] } ]
+        })
+        true
+      end.returns(nil)
+      within all("##{chat.error_target}").last do
+        click_button I18n.t("chats.error.retry")
+      end
+      page.refresh
+      assert_no_selector "##{chat.error_target}"
+      assert_text I18n.t("chats.thinking")
+      perform_enqueued_jobs(only: AssistantResponseJob)
+
+      assert_text "Synthetic recovered answer"
+      page.refresh
+      assert_text "Synthetic recovered answer"
+      assert_no_selector "##{chat.error_target}"
+      assert_nil chat.reload.error
+      assert_equal [ question.id ], chat.messages.where(type: "UserMessage").pluck(:id)
+      assert_equal question.ai_model, chat.messages.where(type: "AssistantMessage", status: :complete).sole.ai_model
+    end
   end
 
   test "sidebar shows consent if ai is disabled for user" do

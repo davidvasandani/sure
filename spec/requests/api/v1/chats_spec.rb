@@ -74,6 +74,9 @@ RSpec.describe 'API V1 Chats', type: :request do
     end
   end
 
+  # ChatResource#error is nullable localized public copy. Provider diagnostics
+  # remain internal and are intentionally absent from this documentation fixture.
+
   path '/api/v1/chats' do
     get 'List chats' do
       tags 'Chats'

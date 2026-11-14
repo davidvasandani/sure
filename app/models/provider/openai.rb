@@ -532,7 +532,7 @@ class Provider::Openai < Provider
       user_identifier: nil,
       family: nil
     )
-      with_provider_response do
+      with_provider_response(error_transformer: method(:chat_error_transformer)) do
         session_client = with_session_headers(session_id: session_id)
 
         chat_config = ChatConfig.new(
@@ -583,7 +583,8 @@ class Provider::Openai < Provider
             if response_chunk.nil?
               raise Error.new(
                 build_stream_error_message(error_chunk),
-                details: error_chunk&.data&.details
+                details: error_chunk&.data&.details,
+                failure_code: chat_failure_code(error_chunk&.data&.code)
               )
             end
 
@@ -647,7 +648,7 @@ class Provider::Openai < Provider
       user_identifier: nil,
       family: nil
     )
-      with_provider_response do
+      with_provider_response(error_transformer: method(:chat_error_transformer)) do
         session_client = with_session_headers(session_id: session_id)
 
         messages = build_generic_messages(
@@ -717,6 +718,29 @@ class Provider::Openai < Provider
           raise
         end
       end
+    end
+
+    def chat_failure_code(code)
+      :openai_credits_exhausted if !custom_provider? && code == "credit_balance_exhausted"
+    end
+
+    def chat_error_transformer(error)
+      code = chat_failure_code(http_chat_error_code(error))
+      return default_error_transformer(error) unless code
+
+      Error.new(error.message, details: error.response&.dig(:body), failure_code: code)
+    end
+
+    def http_chat_error_code(error)
+      return unless error.is_a?(Faraday::Error)
+
+      body = error.response&.dig(:body)
+      body = JSON.parse(body) if body.is_a?(String)
+      return unless body.is_a?(Hash) && body["error"].is_a?(Hash)
+
+      body["error"]["code"]
+    rescue JSON::ParserError
+      nil
     end
 
     def build_generic_messages(prompt:, instructions: nil, function_results: [], messages: nil)
