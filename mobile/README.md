@@ -151,7 +151,7 @@ The app includes automated CI/CD via GitHub Actions (`.github/workflows/flutter-
 - **Android Build**: Generates release APK and AAB artifacts
 - **iOS Build**: Generates iOS release build (unsigned)
 - **Quality Checks**: Code analysis and tests run before building
-- **TestFlight**: `mobile-release` (mobile tags) triggers `.github/workflows/ios-testflight.yml` for signed App Store Connect uploads as part of one release flow
+- **TestFlight**: `mobile-release` (mobile tags) triggers `.github/workflows/ios-testflight.yml` for signed App Store Connect uploads as part of one release flow; missing Apple credentials fail preflight rather than silently skipping distribution
 
 See [docs/iOS_TESTFLIGHT.md](docs/iOS_TESTFLIGHT.md) for required secrets and setup.
 

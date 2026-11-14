@@ -11,8 +11,7 @@ class MobileReleaseWorkflowTest < ActiveSupport::TestCase
         assert_equal "#{version}\n", result[:metadata]
         assert_includes result[:output], "SURE_BUILD_NAME=#{name}\n"
       end
-      result = resolve("ios-testflight", "build-and-upload", ref: "v#{version}")
-      assert_equal "#{version}\n", result[:metadata]
+      result = resolve("ios-testflight", "validate-release", ref: "v#{version}")
       assert_includes result[:output], "ios_version=2026.10.31\n"
     end
   end
@@ -27,22 +26,24 @@ class MobileReleaseWorkflowTest < ActiveSupport::TestCase
       [ "main", "v2026.11.1-p202611011234" ] ].each do |ref, selected|
       [ [ "flutter-build", "build-android", selected.delete_prefix("v") ],
         [ "flutter-build", "build-ios", "2026.11.1" ],
-        [ "ios-testflight", "build-and-upload", "2026.11.1" ] ].each do |file, job, name|
+        [ "ios-testflight", "validate-release", "2026.11.1" ] ].each do |file, job, name|
         result = resolve(file, job, ref: ref, selected: selected)
-        assert_equal "#{selected.delete_prefix('v')}\n", result[:metadata]
+        assert_equal "#{selected.delete_prefix('v')}\n", result[:metadata] unless file == "ios-testflight"
         assert_includes result[:output], "=#{name}\n"
       end
     end
   end
 
   test "standalone branch builds retain pubspec fallback" do
-    [ [ "flutter-build", "build-android" ], [ "flutter-build", "build-ios" ],
-      [ "ios-testflight", "build-and-upload" ] ].each do |file, job|
+    [ [ "flutter-build", "build-android" ], [ "flutter-build", "build-ios" ] ].each do |file, job|
       result = resolve(file, job, ref: "main")
       assert_equal "0.0.0-dev\n", result[:metadata]
       name = job == "build-android" ? "0.0.0-dev" : "0.0.0"
       assert_includes result[:output], "=#{name}\n"
     end
+
+    source = Rails.root.join(".github/workflows/ios-testflight.yml").read
+    assert_match(/workflow_dispatch:\n\s+inputs:\n\s+app_version:.*?\n\s+required: true/m, source)
   end
 
   test "automatic TestFlight accepts only canonical calendar tags" do
@@ -171,8 +172,18 @@ class MobileReleaseWorkflowTest < ActiveSupport::TestCase
     end
 
     def resolve(file, job, ref:, selected: "")
-      execute(file, job, "Resolve app version", "GITHUB_REF_TYPE" => ref == "main" ? "branch" : "tag",
-        "GITHUB_REF_NAME" => ref, "APP_VERSION_INPUT" => selected)
+      env = { "GITHUB_REF_TYPE" => ref == "main" ? "branch" : "tag",
+        "GITHUB_REF_NAME" => ref, "APP_VERSION_INPUT" => selected }
+      if file == "ios-testflight"
+        env.merge!("APP_BUNDLE_ID" => "am.sure.mobile", "GITHUB_STEP_SUMMARY" => File::NULL)
+        %w[IOS_KEYCHAIN_PASSWORD IOS_DISTRIBUTION_P12_BASE64 IOS_DISTRIBUTION_P12_PASSWORD
+          IOS_PROVISIONING_PROFILE_BASE64 IOS_PROVISIONING_PROFILE_NAME IOS_TEAM_ID
+          IOS_DISTRIBUTION_CERT_NAME APP_STORE_CONNECT_API_KEY_ID
+          APP_STORE_CONNECT_API_KEY_BASE64 APP_STORE_CONNECT_API_ISSUER_ID].each { |name| env[name] = "test" }
+        execute(file, job, "Validate TestFlight configuration", env)
+      else
+        execute(file, job, "Resolve app version", env)
+      end
     end
 
     def eligible?(event, ref, selected = "")
