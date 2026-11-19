@@ -2389,6 +2389,7 @@ class Family::DataImporterTest < ActiveSupport::TestCase
           budget_id: "budget-1",
           category_id: "cat-groceries",
           budgeted_spending: "500.00",
+          rollover_enabled: true,
           currency: "USD"
         }
       }
@@ -2402,6 +2403,79 @@ class Family::DataImporterTest < ActiveSupport::TestCase
     assert_not_nil budget_category
     assert_equal "Groceries", budget_category.category.name
     assert_equal 500.0, budget_category.budgeted_spending.to_f
+    assert budget_category.rollover_enabled?
+  end
+
+  test "imports a budget_category with only its required fields" do
+    ndjson = build_ndjson([
+      { type: "Category", data: { id: "cat-groceries", name: "Groceries", color: "#00FF00", classification: "expense" } },
+      { type: "Budget", data: { id: "budget-1", start_date: "2024-01-01", end_date: "2024-01-31", currency: "USD" } },
+      { type: "BudgetCategory", data: { id: "bc-1", budget_id: "budget-1", category_id: "cat-groceries" } }
+    ])
+
+    Family::DataImporter.new(@family, ndjson).import!
+
+    budget_category = @family.budgets.first.budget_categories.first
+    assert_equal 0, budget_category.budgeted_spending
+    assert_not budget_category.rollover_enabled?
+  end
+
+  test "keeps the stored amount and rollover of a budget category when a later line omits them" do
+    ndjson = build_ndjson([
+      { type: "Category", data: { id: "cat-groceries", name: "Groceries", color: "#00FF00", classification: "expense" } },
+      { type: "Budget", data: { id: "budget-1", start_date: "2024-01-01", end_date: "2024-01-31", currency: "USD" } },
+      { type: "BudgetCategory", data: { id: "bc-1", budget_id: "budget-1", category_id: "cat-groceries", budgeted_spending: "500.00", rollover_enabled: true } },
+      { type: "BudgetCategory", data: { id: "bc-2", budget_id: "budget-1", category_id: "cat-groceries" } }
+    ])
+
+    Family::DataImporter.new(@family, ndjson).import!
+
+    budget_category = @family.budgets.first.budget_categories.first
+    assert_equal 500, budget_category.budgeted_spending
+    assert budget_category.rollover_enabled?
+  end
+
+  test "treats a blank rollover_enabled as absent" do
+    ndjson = build_ndjson([
+      { type: "Category", data: { id: "cat-groceries", name: "Groceries", color: "#00FF00", classification: "expense" } },
+      { type: "Budget", data: { id: "budget-1", start_date: "2024-01-01", end_date: "2024-01-31", currency: "USD" } },
+      { type: "BudgetCategory", data: { id: "bc-1", budget_id: "budget-1", category_id: "cat-groceries", budgeted_spending: "500.00", rollover_enabled: true } },
+      { type: "BudgetCategory", data: { id: "bc-2", budget_id: "budget-1", category_id: "cat-groceries", rollover_enabled: "" } }
+    ])
+
+    Family::DataImporter.new(@family, ndjson).import!
+
+    assert @family.budgets.first.budget_categories.first.rollover_enabled?
+  end
+
+  test "recomputes the carried-over amount of restored rollover budgets" do
+    ndjson = build_ndjson([
+      { type: "Category", data: { id: "cat-groceries", name: "Groceries", color: "#00FF00", classification: "expense" } },
+      { type: "Budget", data: { id: "budget-1", start_date: "2024-01-01", end_date: "2024-01-31", budgeted_spending: "500.00", expected_income: "1000.00", currency: "USD" } },
+      { type: "Budget", data: { id: "budget-2", start_date: "2024-02-01", end_date: "2024-02-29", budgeted_spending: "500.00", expected_income: "1000.00", currency: "USD" } },
+      { type: "BudgetCategory", data: { id: "bc-1", budget_id: "budget-1", category_id: "cat-groceries", budgeted_spending: "500.00", rollover_enabled: true } },
+      { type: "BudgetCategory", data: { id: "bc-2", budget_id: "budget-2", category_id: "cat-groceries", budgeted_spending: "500.00", rollover_enabled: true } }
+    ])
+
+    Family::DataImporter.new(@family, ndjson).import!
+
+    february = @family.budgets.find_by!(start_date: Date.new(2024, 2, 1))
+    assert_equal 500, february.budget_categories.first.rolled_over_amount
+  end
+
+  test "keeps the import when recomputing rollover amounts fails, and logs it" do
+    ndjson = build_ndjson([
+      { type: "Category", data: { id: "cat-groceries", name: "Groceries", color: "#00FF00", classification: "expense" } },
+      { type: "Budget", data: { id: "budget-1", start_date: "2024-01-01", end_date: "2024-01-31", budgeted_spending: "500.00", expected_income: "1000.00", currency: "USD" } },
+      { type: "BudgetCategory", data: { id: "bc-1", budget_id: "budget-1", category_id: "cat-groceries", budgeted_spending: "500.00", rollover_enabled: true } }
+    ])
+    Budget::RolloverCalculator.any_instance.stubs(:recompute!).raises(StandardError, "boom")
+
+    assert_difference -> { DebugLogEntry.where(family: @family, category: "import").count }, 1 do
+      Family::DataImporter.new(@family, ndjson).import!
+    end
+
+    assert @family.budgets.first.budget_categories.first.rollover_enabled?
   end
 
   test "reuses an untouched default budget for the same period" do
@@ -2498,7 +2572,7 @@ class Family::DataImporterTest < ActiveSupport::TestCase
   test "imports rules in their exported run order after existing rules" do
     existing = @family.rules.create!(resource_type: "transaction",
       actions: [ Rule::Action.new(action_type: "exclude_transaction") ])
-    rule_record = ->(name, position, stop_processing) do
+    rule_record = ->(name, position, stop_processing, apply_immediately) do
       {
         type: "Rule",
         version: 1,
@@ -2508,12 +2582,13 @@ class Family::DataImporterTest < ActiveSupport::TestCase
           active: true,
           position: position,
           stop_processing: stop_processing,
+          apply_immediately: apply_immediately,
           conditions: [ { condition_type: "transaction_name", operator: "like", value: name } ],
           actions: [ { action_type: "exclude_transaction" } ]
         }
       }
     end
-    ndjson = build_ndjson([ rule_record.call("Second", 2, false), rule_record.call("First", 1, true) ])
+    ndjson = build_ndjson([ rule_record.call("Second", 2, false, true), rule_record.call("First", 1, true, false) ])
 
     Family::DataImporter.new(@family, ndjson).import!
 
@@ -2521,6 +2596,8 @@ class Family::DataImporterTest < ActiveSupport::TestCase
       @family.rules.ordered.pluck(:id).last(3)
     assert @family.rules.find_by(name: "First").stop_processing
     assert_not @family.rules.find_by(name: "Second").stop_processing
+    assert_not @family.rules.find_by(name: "First").apply_immediately
+    assert @family.rules.find_by(name: "Second").apply_immediately
   end
 
   test "imports rule groups by name and keeps each group in one block" do
@@ -3015,6 +3092,31 @@ class Family::DataImporterTest < ActiveSupport::TestCase
     assert_equal [ "set_transaction_name" ], rule.actions.map(&:action_type)
     assert_equal [ "other-old" ], other_rule.reload.conditions.map(&:value)
     assert_equal [ "auto_categorize" ], other_rule.actions.map(&:action_type)
+  end
+
+  test "session rule reimport keeps apply immediately when the export predates it" do
+    rule = @family.rules.create!(name: "Immediate Rule", resource_type: "transaction", active: true, apply_immediately: true,
+      actions: [ Rule::Action.new(action_type: "exclude_transaction") ])
+    session = @family.import_sessions.create!(expected_chunks: 1)
+    session.source_mappings.create!(family: @family, source_type: "Rule", source_id: "rule-1", target: rule)
+
+    ndjson = build_ndjson([
+      {
+        type: "Rule",
+        version: 1,
+        data: {
+          id: "rule-1",
+          name: "Immediate Rule",
+          resource_type: "transaction",
+          active: true,
+          actions: [ { action_type: "exclude_transaction" } ]
+        }
+      }
+    ])
+
+    Family::DataImporter.new(@family, ndjson, import_session: session).import!
+
+    assert rule.reload.apply_immediately
   end
 
   test "imports rules from normalized operand value refs" do
