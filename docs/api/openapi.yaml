@@ -10462,6 +10462,7 @@ paths:
                         interest, fee)
                     fee:
                       type: number
+                      minimum: 0
                       description: Optional fee (buy/sell/sweep_in/sweep_out/reinvestment)
                     type:
                       type: string
@@ -10573,6 +10574,13 @@ paths:
             application/json:
               schema:
                 "$ref": "#/components/schemas/ErrorResponse"
+        '422':
+          description: qty or price is not a positive number, or nature is not inflow
+            or outflow
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/ErrorResponse"
       requestBody:
         content:
           application/json:
@@ -10587,8 +10595,13 @@ paths:
                       format: date
                     qty:
                       type: number
+                      description: Positive quantity. Sending qty, price, type or
+                        nature recomputes the entry amount as signed qty * price +
+                        fee, where qty is negative on a sell; what the request leaves
+                        out is taken from the trade.
                     price:
                       type: number
+                      description: Positive price per unit
                     type:
                       type: string
                       enum:
@@ -10597,11 +10610,13 @@ paths:
                       - sweep_in
                       - sweep_out
                       - reinvestment
+                      description: Side of the trade; takes precedence over nature
                     nature:
                       type: string
                       enum:
                       - inflow
                       - outflow
+                      description: inflow is a sell, outflow a buy
                     name:
                       type: string
                     notes:
@@ -10920,8 +10935,9 @@ paths:
               schema:
                 "$ref": "#/components/schemas/ErrorResponse"
         '422':
-          description: validation error - malformed tag_ids, or a tag, category or
-            merchant id the family cannot use
+          description: validation error - unknown nature, an amount or nature change
+            on a transfer, malformed tag_ids, or a tag, category or merchant id the
+            family cannot use
           content:
             application/json:
               schema:
@@ -10963,6 +10979,8 @@ paths:
                       - expense
                       - inflow
                       - outflow
+                      description: Sign of the amount. Without amount, applies to
+                        the stored amount.
                     tag_ids:
                       type: array
                       items:
